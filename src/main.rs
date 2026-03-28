@@ -1,11 +1,4 @@
-use std::{
-  collections::hash_map::DefaultHasher,
-  fs::File,
-  hash::{Hash, Hasher},
-  net::IpAddr,
-  num::NonZero,
-  sync::{Arc, Mutex},
-};
+use std::hash::{Hash, Hasher};
 
 use lru::LruCache;
 use maxminddb::Reader;
@@ -17,7 +10,7 @@ const CACHE_SIZE: usize = 1024;
 
 #[derive(serde::Deserialize)]
 struct GeoIpQuery {
-  ip: String,
+  ip: std::net::IpAddr,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -27,19 +20,17 @@ struct GeoIpResponse {
   asn: Option<String>,
 }
 
-struct CacheShard(Mutex<LruCache<IpAddr, GeoIpResponse>>);
+struct CacheShard(std::sync::Mutex<LruCache<std::net::IpAddr, GeoIpResponse>>);
 
 impl CacheShard {
   fn new() -> Self {
-    let cache_size = NonZero::new(CACHE_SIZE).unwrap();
-    Self(Mutex::new(LruCache::new(cache_size)))
+    let cache_size = std::num::NonZeroUsize::new(CACHE_SIZE).unwrap();
+    Self(std::sync::Mutex::new(LruCache::new(cache_size)))
   }
-
-  fn get(&self, ip: &IpAddr) -> Option<GeoIpResponse> {
+  fn get(&self, ip: &std::net::IpAddr) -> Option<GeoIpResponse> {
     self.0.lock().ok()?.get(ip).cloned()
   }
-
-  fn set(&self, ip: IpAddr, response: GeoIpResponse) {
+  fn set(&self, ip: std::net::IpAddr, response: GeoIpResponse) {
     if let Ok(mut cache) = self.0.lock() {
       cache.put(ip, response);
     }
@@ -49,38 +40,35 @@ impl CacheShard {
 struct AppInner(Reader<Mmap>, Reader<Mmap>, Vec<CacheShard>);
 
 #[derive(Clone)]
-struct AppState(Arc<AppInner>);
+struct AppState(std::sync::Arc<AppInner>);
 
 impl AppState {
   fn open_mmap(path: &str) -> anyhow::Result<Reader<Mmap>> {
     Ok(Reader::from_source(unsafe {
-      Mmap::map(&File::open(path)?)?
+      Mmap::map(&std::fs::File::open(path)?)?
     })?)
   }
-
   fn new() -> anyhow::Result<Self> {
-    Ok(Self(Arc::new(AppInner(
+    Ok(Self(std::sync::Arc::new(AppInner(
       Self::open_mmap("./mmdb/GeoLite2-City.mmdb")?,
       Self::open_mmap("./mmdb/GeoLite2-ASN.mmdb")?,
       (0..SHARD_SIZE).map(|_| CacheShard::new()).collect(),
     ))))
   }
-
-  fn shard(&self, ip: &IpAddr) -> &CacheShard {
-    let mut hasher = DefaultHasher::new();
+  fn shard(&self, ip: &std::net::IpAddr) -> &CacheShard {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     ip.hash(&mut hasher);
     &self.0.2[(hasher.finish() as usize) % SHARD_SIZE]
   }
-
-  fn lookup(&self, ip: IpAddr) -> anyhow::Result<GeoIpResponse> {
-    let shard = self.shard(&ip);
-    if let Some(v) = shard.get(&ip) {
+  fn lookup(&self, ip: &std::net::IpAddr) -> anyhow::Result<GeoIpResponse> {
+    let shard = self.shard(ip);
+    if let Some(v) = shard.get(ip) {
       return Ok(v.to_owned());
     }
     let (country, city) = self
       .0
       .0
-      .lookup(ip)?
+      .lookup(*ip)?
       .decode::<maxminddb::geoip2::City>()?
       .map(|c| {
         (
@@ -92,11 +80,11 @@ impl AppState {
     let asn = self
       .0
       .1
-      .lookup(ip)?
+      .lookup(*ip)?
       .decode::<maxminddb::geoip2::Asn>()?
       .and_then(|a| a.autonomous_system_organization.map(|s| s.to_owned()));
     let result = GeoIpResponse { country, city, asn };
-    shard.set(ip, result.to_owned());
+    shard.set(*ip, result.to_owned());
     Ok(result)
   }
 }
@@ -106,12 +94,9 @@ pub async fn geoip_handler(
   app_state: web::types::State<AppState>,
   query: web::types::Query<GeoIpQuery>,
 ) -> web::HttpResponse {
-  match query.ip.parse::<std::net::IpAddr>() {
-    Err(_) => web::HttpResponse::BadRequest().finish(),
-    Ok(ip) => match app_state.lookup(ip) {
-      Err(_) => web::HttpResponse::InternalServerError().finish(),
-      Ok(geoip) => web::HttpResponse::Ok().json(&geoip),
-    },
+  match app_state.lookup(&query.ip) {
+    Err(_) => web::HttpResponse::InternalServerError().finish(),
+    Ok(geoip) => web::HttpResponse::Ok().json(&geoip),
   }
 }
 
